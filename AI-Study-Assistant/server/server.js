@@ -75,7 +75,7 @@ async function askAI(prompt) {
   );
 
   const model = ai.getGenerativeModel({
-    model: "gemini-3.6-flash"
+    model: "gemini-2.5-flash"
   });
 
   const result = await model.generateContent(prompt);
