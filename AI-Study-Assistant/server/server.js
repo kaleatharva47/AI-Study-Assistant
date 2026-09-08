@@ -4,7 +4,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
 import fs from "fs";
-import path from "path";
 import JSZip from "jszip";
 
 dotenv.config();
@@ -14,11 +13,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ===============================
+// UPLOAD DIRECTORY
+// ===============================
+
 const uploadDir = "uploads";
 
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir);
 }
+
+// ===============================
+// MULTER CONFIGURATION
+// ===============================
 
 const upload = multer({
   dest: uploadDir,
@@ -27,14 +34,28 @@ const upload = multer({
   }
 });
 
+// ===============================
+// EXTRACT TEXT FROM PPTX
+// ===============================
+
 async function extractText(filePath) {
-  const zip = await JSZip.loadAsync(fs.readFileSync(filePath));
+  const zip = await JSZip.loadAsync(
+    fs.readFileSync(filePath)
+  );
 
   const names = Object.keys(zip.files)
-    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+    .filter((name) =>
+      /^ppt\/slides\/slide\d+\.xml$/.test(name)
+    )
     .sort((a, b) => {
-      const slideA = Number(a.match(/slide(\d+)/)[1]);
-      const slideB = Number(b.match(/slide(\d+)/)[1]);
+      const slideA = Number(
+        a.match(/slide(\d+)/)[1]
+      );
+
+      const slideB = Number(
+        b.match(/slide(\d+)/)[1]
+      );
+
       return slideA - slideB;
     });
 
@@ -62,46 +83,110 @@ async function extractText(filePath) {
   return slides;
 }
 
+// ===============================
+// GROQ AI FUNCTION
+// ===============================
+
 async function askAI(prompt) {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is missing in .env");
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error(
+      "GROQ_API_KEY is missing in .env"
+    );
   }
 
-  const { GoogleGenerativeAI } =
-    await import("@google/generative-ai");
+  console.log("Sending request to Groq AI...");
 
-  const ai = new GoogleGenerativeAI(
-    process.env.GEMINI_API_KEY
+  const response = await fetch(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`
+      },
+
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+
+        temperature: 0.2,
+        max_tokens: 4000
+      })
+    }
   );
 
-  const model = ai.getGenerativeModel({
-    model: "gemini-3.8-flash"
-  });
+  const data = await response.json();
 
-  const result = await model.generateContent(prompt);
+  if (!response.ok) {
+    console.error("Groq API Error:", data);
 
-  return result.response.text();
+    throw new Error(
+      data?.error?.message ||
+      `Groq API error: ${response.status}`
+    );
+  }
+
+  const text =
+    data?.choices?.[0]?.message?.content;
+
+  if (!text) {
+    throw new Error(
+      "Groq returned an empty response."
+    );
+  }
+
+  console.log(
+    "Groq AI response received successfully."
+  );
+
+  return text;
 }
+
+// ===============================
+// HOME ROUTE
+// ===============================
 
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "AI Study Assistant Backend is running"
+    message:
+      "AI Study Assistant Backend is running"
   });
 });
+
+// ===============================
+// ANALYZE PPT ROUTE
+// ===============================
 
 app.post(
   "/api/analyze",
   upload.single("ppt"),
+
   async (req, res) => {
     let filePath;
 
     try {
+      // -------------------------------
+      // CHECK FILE
+      // -------------------------------
+
       if (!req.file) {
         return res.status(400).json({
-          error: "Please upload a PPTX file."
+          error:
+            "Please upload a PPTX file."
         });
       }
+
+      // -------------------------------
+      // CHECK FILE TYPE
+      // -------------------------------
 
       if (
         !req.file.originalname
@@ -109,64 +194,121 @@ app.post(
           .endsWith(".pptx")
       ) {
         return res.status(400).json({
-          error: "Only .pptx files are supported."
+          error:
+            "Only .pptx files are supported."
         });
       }
 
       filePath = req.file.path;
 
-      console.log("PPT received:", req.file.originalname);
+      console.log(
+        "PPT received:",
+        req.file.originalname
+      );
 
-      const slides = await extractText(filePath);
+      // -------------------------------
+      // EXTRACT SLIDES
+      // -------------------------------
 
-      console.log("Slides extracted:", slides.length);
+      const slides =
+        await extractText(filePath);
+
+      console.log(
+        "Slides extracted:",
+        slides.length
+      );
+
+      // -------------------------------
+      // CREATE CONTENT
+      // -------------------------------
 
       const content = slides
-        .map((slide, index) => `Slide ${index + 1}: ${slide}`)
+        .map(
+          (slide, index) =>
+            `Slide ${index + 1}: ${slide}`
+        )
         .join("\n");
 
       if (!content.trim()) {
         return res.status(400).json({
-          error: "No readable text found in PPTX."
+          error:
+            "No readable text found in PPTX."
         });
       }
 
+      // -------------------------------
+      // AI PROMPT
+      // -------------------------------
+
       const prompt = `
-Analyze this PowerPoint as a college study assistant.
+You are an AI Study Assistant for college students.
 
-Return ONLY valid JSON.
+Analyze the PowerPoint content provided below.
 
-Use exactly this format:
+Your job is to create:
+
+1. A clear study-friendly summary.
+2. A list of important topics.
+3. Exactly 10 multiple-choice questions.
+
+IMPORTANT RULES:
+
+- Return ONLY valid JSON.
+- Do NOT use Markdown.
+- Do NOT use code blocks.
+- Do NOT add any explanation outside JSON.
+- Questions must be based ONLY on the PowerPoint content.
+- Do not invent information.
+- Use simple English suitable for college students.
+- Every MCQ must have exactly 4 options.
+- The answer must be exactly one of the four options.
+- Include a short explanation for every answer.
+- Create exactly 10 MCQs.
+
+Use EXACTLY this JSON structure:
 
 {
-  "summary": "A clear study-friendly summary",
+  "summary": "Clear study-friendly summary",
+
   "importantTopics": [
     "Topic 1",
     "Topic 2",
     "Topic 3"
   ],
+
   "quiz": [
     {
-      "question": "Question",
-      "options": ["A", "B", "C", "D"],
-      "answer": "A",
+      "question": "Question 1",
+      "options": [
+        "Option A",
+        "Option B",
+        "Option C",
+        "Option D"
+      ],
+      "answer": "Option A",
       "explanation": "Short explanation"
     }
   ]
 }
-
-Create exactly 10 MCQs.
-
-The questions must be based ONLY on the PowerPoint content.
-
-Keep the language simple and suitable for college students.
 
 POWERPOINT CONTENT:
 
 ${content.slice(0, 120000)}
 `;
 
+      // -------------------------------
+      // ASK GROQ
+      // -------------------------------
+
       let raw = await askAI(prompt);
+
+      console.log(
+        "Raw AI response received."
+      );
+
+      // -------------------------------
+      // CLEAN AI RESPONSE
+      // -------------------------------
 
       raw = raw
         .replace(/^```json\s*/i, "")
@@ -174,37 +316,138 @@ ${content.slice(0, 120000)}
         .replace(/\s*```$/i, "")
         .trim();
 
-      const result = JSON.parse(raw);
+      // -------------------------------
+      // FIND JSON
+      // -------------------------------
+
+      const firstBrace =
+        raw.indexOf("{");
+
+      const lastBrace =
+        raw.lastIndexOf("}");
+
+      if (
+        firstBrace !== -1 &&
+        lastBrace !== -1
+      ) {
+        raw = raw.substring(
+          firstBrace,
+          lastBrace + 1
+        );
+      }
+
+      // -------------------------------
+      // PARSE JSON
+      // -------------------------------
+
+      let result;
+
+      try {
+        result = JSON.parse(raw);
+      } catch (jsonError) {
+        console.error(
+          "Invalid JSON from AI:"
+        );
+
+        console.error(raw);
+
+        throw new Error(
+          "AI returned an invalid JSON response. Please try again."
+        );
+      }
+
+      // -------------------------------
+      // VALIDATE RESULT
+      // -------------------------------
+
+      if (
+        !result.summary ||
+        !Array.isArray(
+          result.importantTopics
+        ) ||
+        !Array.isArray(result.quiz)
+      ) {
+        throw new Error(
+          "AI returned an incomplete result."
+        );
+      }
+
+      // -------------------------------
+      // CHECK QUESTIONS
+      // -------------------------------
+
+      if (result.quiz.length < 10) {
+        throw new Error(
+          `AI generated only ${result.quiz.length} questions. Please try again.`
+        );
+      }
+
+      // Exactly 10 questions
+      result.quiz =
+        result.quiz.slice(0, 10);
+
+      // -------------------------------
+      // SEND RESULT
+      // -------------------------------
 
       res.json({
         success: true,
         slides: slides.length,
         summary: result.summary,
-        importantTopics: result.importantTopics,
+        importantTopics:
+          result.importantTopics,
         quiz: result.quiz
       });
 
     } catch (error) {
-      console.error("ANALYSIS ERROR:", error);
+      console.error(
+        "ANALYSIS ERROR:",
+        error
+      );
 
       res.status(500).json({
-        error: error.message || "Analysis failed"
+        error:
+          error.message ||
+          "Analysis failed"
       });
 
     } finally {
+
+      // -------------------------------
+      // DELETE UPLOADED PPT
+      // -------------------------------
+
       if (
         filePath &&
         fs.existsSync(filePath)
       ) {
-        fs.unlinkSync(filePath);
+        try {
+          fs.unlinkSync(filePath);
+
+          console.log(
+            "Uploaded PPT deleted."
+          );
+
+        } catch (deleteError) {
+          console.error(
+            "Could not delete uploaded file:",
+            deleteError.message
+          );
+        }
       }
     }
   }
 );
 
-const PORT = process.env.PORT || 5000;
+// ===============================
+// START SERVER
+// ===============================
+
+const PORT =
+  process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(
+    `Server running on port ${PORT}`
+  );
 });
-
